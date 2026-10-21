@@ -1,0 +1,32 @@
+name = "b2-connect-edge-core"
+main = "src/index.ts"
+compatibility_date = "2025-02-14"
+compatibility_flags = ["nodejs_compat"]
+
+# Workers Free Tier / Paid Tier Durable Objects & Hibernation configuration
+[durable_objects]
+bindings = [
+  { name = "CLASSROOM_ROOMS", class_name = "ClassroomRoom" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ClassroomRoom"]
+
+# Cloudflare D1 Serverless SQL Database for persistent rooms, attendance, polls, and files
+[[d1_databases]]
+binding = "DB"
+database_name = "b2_connect_production_db"
+database_id = "00000000-0000-0000-0000-000000000001"
+migrations_dir = "."
+
+# Cloudflare R2 Zero-Egress Object Storage for Classroom PDF Slides, Pamphlets & Recordings
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "b2-connect-classroom-vault"
+
+[vars]
+ENVIRONMENT = "production"
+MAX_ROOMS = "50"
+MAX_PARTICIPANTS_PER_ROOM = "35"
+ALLOWED_ORIGIN = "*"

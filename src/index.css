@@ -1,0 +1,99 @@
+@import "tailwindcss";
+
+@layer base {
+  :root,
+  [data-theme="espresso"] {
+    --bg-primary: #0A0807;
+    --bg-secondary: #14100E;
+    --surface-glass: rgba(28, 21, 17, 0.72);
+    --surface-elevated: rgba(42, 32, 26, 0.85);
+    --text-primary: #FAF7F5;
+    --text-secondary: #D5C7BC;
+    --text-muted: #9A897C;
+    --accent-gold: #D4A373;
+    --accent-crema: #E6CCB2;
+    --border-specular: rgba(212, 163, 115, 0.22);
+  }
+
+  [data-theme="noir"] {
+    --bg-primary: #050506;
+    --bg-secondary: #0D0D10;
+    --surface-glass: rgba(16, 16, 20, 0.80);
+    --surface-elevated: rgba(26, 26, 32, 0.90);
+    --text-primary: #F8FAFC;
+    --text-secondary: #CBD5E1;
+    --text-muted: #64748B;
+    --accent-gold: #E2B887;
+    --accent-crema: #F1DEC9;
+    --border-specular: rgba(226, 184, 135, 0.20);
+  }
+
+  [data-theme="daylight"] {
+    --bg-primary: #F4EFEA;
+    --bg-secondary: #EAE2D9;
+    --surface-glass: rgba(255, 255, 255, 0.86);
+    --surface-elevated: rgba(250, 246, 240, 0.95);
+    --text-primary: #1A130F;
+    --text-secondary: #4A3B31;
+    --text-muted: #7D6A5D;
+    --accent-gold: #9C6B3B;
+    --accent-crema: #7F5539;
+    --border-specular: rgba(156, 107, 59, 0.24);
+  }
+
+  * {
+    box-sizing: border-box;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  html,
+  body {
+    margin: 0;
+    padding: 0;
+    width: 100vw;
+    height: 100dvh;
+    max-height: 100dvh;
+    overflow: hidden;
+    font-family: 'Plus Jakarta Sans', 'Vazirmatn', system-ui, -apple-system, sans-serif;
+    background-color: var(--bg-primary);
+    color: var(--text-primary);
+  }
+}
+
+.font-mono-tabular {
+  font-family: 'JetBrains Mono', monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.b2-glass-pod {
+  background: var(--surface-glass);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid var(--border-specular);
+}
+
+.b2-glass-elevated {
+  background: var(--surface-elevated);
+  backdrop-filter: blur(28px);
+  -webkit-backdrop-filter: blur(28px);
+  border: 1px solid var(--border-specular);
+}
+
+/* Custom sleek scrollbars */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(212, 163, 115, 0.28);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(212, 163, 115, 0.5);
+}

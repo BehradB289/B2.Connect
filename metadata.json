@@ -1,0 +1,11 @@
+{
+  "name": "B2.Connect — Virtual Classroom & STEM Webinar Platform",
+  "description": "Next-generation virtual classroom and STEM webinar platform featuring Rainy Espresso glassmorphism, 16:9 normalized vector whiteboard, live Focus Radar anti-cheat telemetry, asymmetric WebRTC & WebSocket room sync, and 50-room Super Admin Command Center.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
