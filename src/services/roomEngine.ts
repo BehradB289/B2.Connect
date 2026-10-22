@@ -12,9 +12,17 @@ import type {
   RoomStateSnapshot,
   SharedFileItem,
   UserRole,
+  WebRTCSignalPayload,
   WhiteboardStroke,
 } from '../types/classroom';
 import { calculateEngagementXp } from '../utils/classroomRules';
+
+const RTC_CONFIGURATION: RTCConfiguration = {
+  iceServers: [
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    { urls: 'stun:stun.l.google.com:19302' },
+  ],
+};
 
 /**
  * Fetches only real rooms from the backend `/api/rooms`.
@@ -66,6 +74,7 @@ type RoomListener = (state: RoomStateSnapshot) => void;
 type ConnectionListener = (conn: ConnectionState) => void;
 type LaserListener = (laser: LaserPointerPosition | null) => void;
 type ReactionListener = (reaction: EmojiReactionEvent) => void;
+type RemoteStreamListener = (streams: Record<string, MediaStream>) => void;
 
 export class B2RoomEngine {
   private ws: WebSocket | null = null;
@@ -74,14 +83,21 @@ export class B2RoomEngine {
   private telemetryInterval: number | null = null;
   private connectionState: ConnectionState = 'reconnecting';
   private localParticipantId = '';
+  private localParticipantName = '';
   private mediaRecorder: MediaRecorder | null = null;
   private recordedChunks: Blob[] = [];
+
+  // WebRTC Peer-to-Peer State
+  private localMediaStream: MediaStream | null = null;
+  private peerConnections = new Map<string, RTCPeerConnection>();
+  private remoteStreams = new Map<string, MediaStream>();
 
   private state: RoomStateSnapshot;
   private listeners = new Set<RoomListener>();
   private connListeners = new Set<ConnectionListener>();
   private laserListeners = new Set<LaserListener>();
   private reactionListeners = new Set<ReactionListener>();
+  private remoteStreamListeners = new Set<RemoteStreamListener>();
 
   constructor() {
     this.state = {
@@ -139,6 +155,25 @@ export class B2RoomEngine {
     return () => this.reactionListeners.delete(listener);
   }
 
+  public subscribeRemoteStreams(listener: RemoteStreamListener): () => void {
+    this.remoteStreamListeners.add(listener);
+    listener(this.getRemoteStreamsRecord());
+    return () => this.remoteStreamListeners.delete(listener);
+  }
+
+  private getRemoteStreamsRecord(): Record<string, MediaStream> {
+    const out: Record<string, MediaStream> = {};
+    for (const [peerId, stream] of this.remoteStreams.entries()) {
+      out[peerId] = stream;
+    }
+    return out;
+  }
+
+  private notifyRemoteStreams(): void {
+    const snapshot = this.getRemoteStreamsRecord();
+    for (const l of this.remoteStreamListeners) l(snapshot);
+  }
+
   private notify(): void {
     const snapshot = { ...this.state };
     for (const l of this.listeners) l(snapshot);
@@ -150,8 +185,7 @@ export class B2RoomEngine {
   }
 
   /**
-   * Connects to the live WebSocket backend (`/ws`) with only the real local user
-   * and real server state (zero fake students, zero fake strokes, zero fake messages).
+   * Connects to the live WebSocket backend (`/ws`) with strict room isolation.
    */
   public connectToRoom(params: {
     roomId: string;
@@ -164,6 +198,7 @@ export class B2RoomEngine {
     this.disconnect();
 
     this.localParticipantId = params.participantId;
+    this.localParticipantName = params.participantName;
     const localParticipant: Participant = {
       id: params.participantId,
       name: params.participantName,
@@ -237,6 +272,13 @@ export class B2RoomEngine {
       socket.onopen = () => {
         this.reconnectAttempt = 0;
         this.setConnState('connected');
+        // Request active WebRTC streams from any broadcasting host/peer in this room
+        this.sendWebRTCSignal({
+          roomId: params.roomId,
+          senderId: params.participantId,
+          senderName: params.participantName,
+          signalType: 'request-offer',
+        });
       };
 
       socket.onmessage = (event) => {
@@ -286,13 +328,203 @@ export class B2RoomEngine {
     }
   }
 
+  // ============================================================================
+  // REAL WEBRTC PEER-TO-PEER AUDIO/VIDEO RELAY ENGINE
+  // ============================================================================
+
+  private sendWebRTCSignal(signal: WebRTCSignalPayload): void {
+    this.sendPacket('WEBRTC_SIGNAL', signal as unknown as Record<string, unknown>);
+  }
+
+  private getOrCreatePeerConnection(remotePeerId: string): RTCPeerConnection {
+    const existing = this.peerConnections.get(remotePeerId);
+    if (existing && existing.signalingState !== 'closed') {
+      return existing;
+    }
+
+    const pc = new RTCPeerConnection(RTC_CONFIGURATION);
+    this.peerConnections.set(remotePeerId, pc);
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        this.sendWebRTCSignal({
+          roomId: this.state.roomId,
+          senderId: this.localParticipantId,
+          senderName: this.localParticipantName,
+          targetId: remotePeerId,
+          signalType: 'ice-candidate',
+          candidate: event.candidate.toJSON(),
+        });
+      }
+    };
+
+    pc.ontrack = (event) => {
+      const incomingStream = event.streams?.[0] || new MediaStream([event.track]);
+      this.remoteStreams.set(remotePeerId, incomingStream);
+      this.notifyRemoteStreams();
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (
+        pc.connectionState === 'failed' ||
+        pc.connectionState === 'closed' ||
+        pc.connectionState === 'disconnected'
+      ) {
+        // Keep stream until explicit close or participant leave
+      }
+    };
+
+    return pc;
+  }
+
+  private async initiateOfferToPeer(remotePeerId: string): Promise<void> {
+    if (
+      !this.localMediaStream ||
+      this.localMediaStream.getTracks().length === 0 ||
+      remotePeerId === this.localParticipantId ||
+      typeof RTCPeerConnection === 'undefined'
+    ) {
+      return;
+    }
+
+    try {
+      const pc = this.getOrCreatePeerConnection(remotePeerId);
+      const existingSenders = pc.getSenders();
+
+      for (const track of this.localMediaStream.getTracks()) {
+        const alreadySent = existingSenders.find((s) => s.track?.kind === track.kind);
+        if (alreadySent) {
+          await alreadySent.replaceTrack(track);
+        } else {
+          pc.addTrack(track, this.localMediaStream);
+        }
+      }
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      this.sendWebRTCSignal({
+        roomId: this.state.roomId,
+        senderId: this.localParticipantId,
+        senderName: this.localParticipantName,
+        targetId: remotePeerId,
+        signalType: 'offer',
+        sdp: pc.localDescription || offer,
+      });
+    } catch {
+      // Ignore transient WebRTC negotiation error
+    }
+  }
+
+  /**
+   * Attaches the local hardware camera/microphone/screen MediaStream and broadcasts
+   * live WebRTC offers to all participants in the room.
+   */
+  public async setLocalMediaStream(stream: MediaStream | null): Promise<void> {
+    this.localMediaStream = stream;
+
+    if (!stream || stream.getTracks().length === 0) {
+      for (const [, pc] of this.peerConnections.entries()) {
+        try {
+          pc.close();
+        } catch {
+          // Ignore
+        }
+      }
+      this.peerConnections.clear();
+      this.sendWebRTCSignal({
+        roomId: this.state.roomId,
+        senderId: this.localParticipantId,
+        senderName: this.localParticipantName,
+        signalType: 'stream-stopped',
+      });
+      return;
+    }
+
+    const peerIds = Object.keys(this.state.participants).filter(
+      (id) => id !== this.localParticipantId
+    );
+    for (const peerId of peerIds) {
+      await this.initiateOfferToPeer(peerId);
+    }
+  }
+
+  private async handleIncomingWebRTCSignal(signal: WebRTCSignalPayload): Promise<void> {
+    if (!signal || signal.senderId === this.localParticipantId) return;
+    if (signal.roomId && signal.roomId !== this.state.roomId) return;
+    if (signal.targetId && signal.targetId !== this.localParticipantId) return;
+    if (typeof RTCPeerConnection === 'undefined') return;
+
+    const remotePeerId = signal.senderId;
+
+    try {
+      if (signal.signalType === 'request-offer') {
+        if (this.localMediaStream && this.localMediaStream.getTracks().length > 0) {
+          await this.initiateOfferToPeer(remotePeerId);
+        }
+        return;
+      }
+
+      if (signal.signalType === 'stream-stopped') {
+        const existingPc = this.peerConnections.get(remotePeerId);
+        if (existingPc) {
+          existingPc.close();
+          this.peerConnections.delete(remotePeerId);
+        }
+        this.remoteStreams.delete(remotePeerId);
+        this.notifyRemoteStreams();
+        return;
+      }
+
+      const pc = this.getOrCreatePeerConnection(remotePeerId);
+
+      if (signal.signalType === 'offer' && signal.sdp) {
+        await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+        if (this.localMediaStream && this.localMediaStream.getTracks().length > 0) {
+          const existingSenders = pc.getSenders();
+          for (const track of this.localMediaStream.getTracks()) {
+            const alreadySent = existingSenders.find((s) => s.track?.kind === track.kind);
+            if (!alreadySent) {
+              pc.addTrack(track, this.localMediaStream);
+            }
+          }
+        }
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        this.sendWebRTCSignal({
+          roomId: this.state.roomId,
+          senderId: this.localParticipantId,
+          senderName: this.localParticipantName,
+          targetId: remotePeerId,
+          signalType: 'answer',
+          sdp: pc.localDescription || answer,
+        });
+      } else if (signal.signalType === 'answer' && signal.sdp) {
+        if (pc.signalingState === 'have-local-offer') {
+          await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+        }
+      } else if (signal.signalType === 'ice-candidate' && signal.candidate) {
+        await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+      }
+    } catch {
+      // Ignore transient ICE / SDP error
+    }
+  }
+
   private handleServerPacket(packet: { type: string; payload?: Record<string, unknown> }): void {
     const p = packet.payload || {};
     switch (packet.type) {
       case 'ROOM_STATE_SNAPSHOT': {
+        const snapshotRoomId = (p.roomId as string) || this.state.roomId;
+        if (snapshotRoomId !== this.state.roomId) return;
+
         const serverParticipants = (p.participants as Record<string, Participant>) || {};
         const serverStrokes = (p.strokesBySlide as Record<number, WhiteboardStroke[]>) || { 0: [] };
-        const serverMessages = (p.messages as ChatMessage[]) || [];
+        const rawMessages = (p.messages as ChatMessage[]) || [];
+        // Strict Room Isolation: only keep messages belonging to this roomId
+        const roomIsolatedMessages = rawMessages.filter(
+          (m) => !m.roomId || m.roomId === this.state.roomId
+        );
         const serverFiles = (p.sharedFiles as SharedFileItem[]) || [];
 
         this.state = {
@@ -306,7 +538,7 @@ export class B2RoomEngine {
           chatLocked: Boolean(p.chatLocked),
           strokesBySlide: serverStrokes,
           participants: serverParticipants,
-          messages: serverMessages,
+          messages: roomIsolatedMessages,
           activePoll: (p.activePoll as LivePoll) || null,
           sharedFiles: serverFiles,
           activeRollCall:
@@ -403,7 +635,24 @@ export class B2RoomEngine {
         this.notify();
         break;
       }
-      case 'PARTICIPANT_JOINED':
+      case 'PARTICIPANT_JOINED': {
+        const part = p as unknown as Participant;
+        if (part && part.id) {
+          this.state.participants = {
+            ...this.state.participants,
+            [part.id]: part,
+          };
+          this.notify();
+          if (
+            part.id !== this.localParticipantId &&
+            this.localMediaStream &&
+            this.localMediaStream.getTracks().length > 0
+          ) {
+            this.initiateOfferToPeer(part.id);
+          }
+        }
+        break;
+      }
       case 'PARTICIPANT_UPDATED': {
         const part = p as unknown as Participant;
         if (part && part.id) {
@@ -417,18 +666,52 @@ export class B2RoomEngine {
       }
       case 'PARTICIPANT_LEFT': {
         const pid = String(p.participantId || '');
-        if (pid && this.state.participants[pid]) {
-          const next = { ...this.state.participants };
-          delete next[pid];
-          this.state.participants = next;
-          this.notify();
+        if (pid) {
+          if (this.state.participants[pid]) {
+            const next = { ...this.state.participants };
+            delete next[pid];
+            this.state.participants = next;
+            this.notify();
+          }
+          const pc = this.peerConnections.get(pid);
+          if (pc) {
+            pc.close();
+            this.peerConnections.delete(pid);
+          }
+          if (this.remoteStreams.has(pid)) {
+            this.remoteStreams.delete(pid);
+            this.notifyRemoteStreams();
+          }
         }
         break;
       }
       case 'CHAT_MESSAGE': {
         const msg = p.message as ChatMessage;
-        if (msg && !this.state.messages.some((m) => m.id === msg.id)) {
-          this.state.messages = [...this.state.messages, msg];
+        if (
+          msg &&
+          (!msg.roomId || msg.roomId === this.state.roomId) &&
+          !this.state.messages.some((m) => m.id === msg.id)
+        ) {
+          this.state.messages = [
+            ...this.state.messages,
+            { ...msg, roomId: this.state.roomId },
+          ];
+          this.notify();
+        }
+        break;
+      }
+      case 'CHAT_CLEAR': {
+        const targetRoomId = (p.roomId as string) || this.state.roomId;
+        if (targetRoomId === this.state.roomId) {
+          this.state.messages = [];
+          this.notify();
+        }
+        break;
+      }
+      case 'CHAT_DELETE_MESSAGE': {
+        const messageId = String(p.messageId || '');
+        if (messageId) {
+          this.state.messages = this.state.messages.filter((m) => m.id !== messageId);
           this.notify();
         }
         break;
@@ -467,6 +750,10 @@ export class B2RoomEngine {
           this.state.sharedFiles = [file, ...this.state.sharedFiles];
           this.notify();
         }
+        break;
+      }
+      case 'WEBRTC_SIGNAL': {
+        this.handleIncomingWebRTCSignal(p as unknown as WebRTCSignalPayload);
         break;
       }
       case 'EMOJI_REACTION': {
@@ -660,31 +947,44 @@ export class B2RoomEngine {
         micGranted: permission === 'mic' ? nextVal : part.micGranted,
         camGranted: permission === 'cam' ? nextVal : part.camGranted,
         penGranted: permission === 'pen' ? nextVal : part.penGranted,
-        micMuted: permission === 'mic' && nextVal ? false : part.micMuted,
       },
     };
     this.notify();
     this.sendPacket('PERMISSION_TOGGLE', { participantId, permission, value: nextVal });
   }
 
-  public toggleLocalMedia(participantId: string, kind: 'mic' | 'cam'): void {
+  /**
+   * Synchronizes real hardware camera/microphone mute & voice analyser state across the room.
+   */
+  public setLocalMediaState(
+    participantId: string,
+    updates: {
+      micMuted?: boolean;
+      camOff?: boolean;
+      isSpeaking?: boolean;
+      audioLevel?: number;
+    }
+  ): void {
     const part = this.state.participants[participantId];
     if (!part) return;
-    const nextMicMuted = kind === 'mic' ? !part.micMuted : part.micMuted;
-    const nextCamOff = kind === 'cam' ? !part.camOff : part.camOff;
+    const nextPart: Participant = {
+      ...part,
+      micMuted: typeof updates.micMuted === 'boolean' ? updates.micMuted : part.micMuted,
+      camOff: typeof updates.camOff === 'boolean' ? updates.camOff : part.camOff,
+      isSpeaking: typeof updates.isSpeaking === 'boolean' ? updates.isSpeaking : part.isSpeaking,
+      audioLevel: typeof updates.audioLevel === 'number' ? updates.audioLevel : part.audioLevel,
+    };
     this.state.participants = {
       ...this.state.participants,
-      [participantId]: {
-        ...part,
-        micMuted: nextMicMuted,
-        camOff: nextCamOff,
-      },
+      [participantId]: nextPart,
     };
     this.notify();
     this.sendPacket('MEDIA_STATE_TOGGLE', {
       participantId,
-      micMuted: nextMicMuted,
-      camOff: nextCamOff,
+      micMuted: nextPart.micMuted,
+      camOff: nextPart.camOff,
+      isSpeaking: nextPart.isSpeaking,
+      audioLevel: nextPart.audioLevel,
     });
   }
 
@@ -694,15 +994,20 @@ export class B2RoomEngine {
     senderRole: UserRole;
     channel: 'public' | 'private_host' | 'pinned';
     text: string;
+    targetParticipantId?: string;
+    targetParticipantName?: string;
   }): void {
     const trimmed = params.text.trim();
     if (!trimmed) return;
     const message: ChatMessage = {
       id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      roomId: this.state.roomId,
       senderId: params.senderId,
       senderName: params.senderName,
       senderRole: params.senderRole,
       channel: params.channel,
+      targetParticipantId: params.targetParticipantId,
+      targetParticipantName: params.targetParticipantName,
       text: trimmed,
       timestamp: Date.now(),
       pinned: params.channel === 'pinned',
@@ -710,6 +1015,18 @@ export class B2RoomEngine {
     this.state.messages = [...this.state.messages, message];
     this.notify();
     this.sendPacket('CHAT_MESSAGE', { message });
+  }
+
+  public clearChat(): void {
+    this.state.messages = [];
+    this.notify();
+    this.sendPacket('CHAT_CLEAR', { roomId: this.state.roomId });
+  }
+
+  public deleteChatMessage(messageId: string): void {
+    this.state.messages = this.state.messages.filter((m) => m.id !== messageId);
+    this.notify();
+    this.sendPacket('CHAT_DELETE_MESSAGE', { roomId: this.state.roomId, messageId });
   }
 
   public toggleChatLock(): void {
@@ -883,6 +1200,16 @@ export class B2RoomEngine {
       window.clearInterval(this.telemetryInterval);
       this.telemetryInterval = null;
     }
+    for (const [, pc] of this.peerConnections.entries()) {
+      try {
+        pc.close();
+      } catch {
+        // Ignore
+      }
+    }
+    this.peerConnections.clear();
+    this.remoteStreams.clear();
+    this.notifyRemoteStreams();
     if (this.ws) {
       this.ws.onclose = null;
       this.ws.close();

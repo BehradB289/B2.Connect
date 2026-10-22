@@ -84,13 +84,27 @@ export interface Participant {
 
 export interface ChatMessage {
   id: string;
+  roomId: string;
   senderId: string;
   senderName: string;
   senderRole: UserRole;
   channel: 'public' | 'private_host' | 'pinned';
+  /** Optional recipient participant ID for private host <-> student Q&A */
+  targetParticipantId?: string;
+  targetParticipantName?: string;
   text: string;
   timestamp: number;
   pinned?: boolean;
+}
+
+export interface WebRTCSignalPayload {
+  roomId: string;
+  senderId: string;
+  senderName: string;
+  targetId?: string;
+  signalType: 'offer' | 'answer' | 'ice-candidate' | 'request-offer' | 'stream-stopped';
+  sdp?: RTCSessionDescriptionInit;
+  candidate?: RTCIceCandidateInit;
 }
 
 export interface LivePollOption {

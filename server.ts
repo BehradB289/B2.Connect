@@ -27,9 +27,9 @@ interface RoomState {
   timerRunning: boolean;
   strokesBySlide: Record<number, unknown[]>;
   participants: Record<string, Record<string, unknown>>;
-  messages: unknown[];
+  messages: Record<string, unknown>[];
   activePoll: Record<string, unknown> | null;
-  sharedFiles: unknown[];
+  sharedFiles: Record<string, unknown>[];
   activeRollCall: { id: string; expiresAt: number; verifiedIds: string[] } | null;
 }
 
@@ -57,8 +57,10 @@ function loadPersistedRooms(): void {
           if (LEGACY_FAKE_ROOM_IDS.has(r.roomId) || r.instructorName === 'Dr. Behrad Rostami') {
             continue;
           }
-          // Reset ephemeral connected participants on server boot
           r.participants = {};
+          r.messages = Array.isArray(r.messages)
+            ? r.messages.filter((m) => !m.roomId || m.roomId === r.roomId)
+            : [];
           rooms.set(r.roomId, r);
         }
       }
@@ -136,11 +138,19 @@ async function startServer() {
 
   const roomSockets = new Map<string, Set<{ ws: WebSocket; participantId: string }>>();
 
-  function broadcastToRoom(roomId: string, packet: unknown, excludeWs?: WebSocket) {
+  function broadcastToRoom(
+    roomId: string,
+    packet: unknown,
+    excludeWs?: WebSocket,
+    targetParticipantId?: string
+  ) {
     const set = roomSockets.get(roomId);
     if (!set) return;
     const serialized = JSON.stringify(packet);
     for (const item of set) {
+      if (targetParticipantId && item.participantId !== targetParticipantId) {
+        continue;
+      }
       if (item.ws !== excludeWs && item.ws.readyState === WebSocket.OPEN) {
         item.ws.send(serialized);
       }
@@ -368,16 +378,43 @@ async function startServer() {
           if (p) {
             if (typeof payload.micMuted === 'boolean') p.micMuted = payload.micMuted;
             if (typeof payload.camOff === 'boolean') p.camOff = payload.camOff;
+            if (typeof payload.isSpeaking === 'boolean') p.isSpeaking = payload.isSpeaking;
+            if (typeof payload.audioLevel === 'number') p.audioLevel = payload.audioLevel;
             broadcastToRoom(roomId, { type: 'PARTICIPANT_UPDATED', payload: p });
           }
           break;
         }
         case 'CHAT_MESSAGE': {
-          const msg = payload.message as { id?: string };
-          if (msg && !room.messages.some((m) => (m as { id?: string }).id === msg.id)) {
-            room.messages.push(msg);
+          const rawMsg = payload.message as Record<string, unknown> | undefined;
+          if (rawMsg && rawMsg.id) {
+            const stampedMsg: Record<string, unknown> = {
+              ...rawMsg,
+              roomId,
+            };
+            if (!room.messages.some((m) => m.id === stampedMsg.id)) {
+              room.messages.push(stampedMsg);
+              if (room.messages.length > 200) room.messages.shift();
+              savePersistedRooms();
+              broadcastToRoom(roomId, { type: 'CHAT_MESSAGE', payload: { message: stampedMsg } });
+            }
+          }
+          break;
+        }
+        case 'CHAT_CLEAR': {
+          room.messages = [];
+          savePersistedRooms();
+          broadcastToRoom(roomId, { type: 'CHAT_CLEAR', payload: { roomId } });
+          break;
+        }
+        case 'CHAT_DELETE_MESSAGE': {
+          const messageId = String(payload.messageId || '');
+          if (messageId) {
+            room.messages = room.messages.filter((m) => String(m.id) !== messageId);
             savePersistedRooms();
-            broadcastToRoom(roomId, { type: 'CHAT_MESSAGE', payload: { message: msg } });
+            broadcastToRoom(roomId, {
+              type: 'CHAT_DELETE_MESSAGE',
+              payload: { roomId, messageId },
+            });
           }
           break;
         }
@@ -441,8 +478,8 @@ async function startServer() {
           break;
         }
         case 'FILE_SHARE': {
-          const file = payload.file as { id?: string };
-          if (file && !room.sharedFiles.some((f) => (f as { id?: string }).id === file.id)) {
+          const file = payload.file as Record<string, unknown> | undefined;
+          if (file && file.id && !room.sharedFiles.some((f) => f.id === file.id)) {
             room.sharedFiles.unshift(file);
             savePersistedRooms();
             broadcastToRoom(roomId, { type: 'FILE_SHARE', payload: { file } });
@@ -452,9 +489,11 @@ async function startServer() {
         case 'EMOJI_REACTION':
           broadcastToRoom(roomId, { type: 'EMOJI_REACTION', payload });
           break;
-        case 'WEBRTC_SIGNAL':
-          broadcastToRoom(roomId, { type: 'WEBRTC_SIGNAL', payload }, ws);
+        case 'WEBRTC_SIGNAL': {
+          const targetId = typeof payload.targetId === 'string' ? payload.targetId : undefined;
+          broadcastToRoom(roomId, { type: 'WEBRTC_SIGNAL', payload }, ws, targetId);
           break;
+        }
       }
     });
 
@@ -475,7 +514,6 @@ async function startServer() {
     res.json({ status: 'ok', service: 'B2.Connect Real-Time Edge Server' });
   });
 
-  // Real Rooms Directory API (Zero Fake Rooms)
   app.get('/api/rooms', (_req, res) => {
     const list = Array.from(rooms.values())
       .sort((a, b) => b.createdAt - a.createdAt)
@@ -487,7 +525,12 @@ async function startServer() {
         instructorName: r.instructorName,
         activeParticipants: Object.keys(r.participants).length,
         capacity: r.capacity,
-        status: r.activeLayout === 'exam' ? 'exam' : Object.keys(r.participants).length > 0 ? 'live' : 'standby',
+        status:
+          r.activeLayout === 'exam'
+            ? 'exam'
+            : Object.keys(r.participants).length > 0
+            ? 'live'
+            : 'standby',
         latencyMs: 0,
         activeLayout: r.activeLayout,
       }));

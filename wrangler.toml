@@ -1,0 +1,24 @@
+name = "b2-connect"
+main = "backend/src/index.ts"
+compatibility_date = "2025-02-14"
+compatibility_flags = ["nodejs_compat"]
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+[durable_objects]
+bindings = [
+  { name = "CLASSROOM_ROOMS", class_name = "ClassroomRoom" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ClassroomRoom"]
+
+[vars]
+ENVIRONMENT = "production"
+MAX_ROOMS = "50"
+MAX_PARTICIPANTS_PER_ROOM = "35"
+ALLOWED_ORIGIN = "*"

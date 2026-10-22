@@ -60,6 +60,64 @@ import type {
 
 type ActiveSidebarTab = 'attendance' | 'chat' | 'polls' | 'hands' | 'files';
 
+/**
+ * Binds a live MediaStream (Camera, Screen Share, or Remote WebRTC Stream)
+ * to an HTML5 `<video>` element with iOS Safari & Mobile Autoplay compliance.
+ */
+const LiveStreamVideo: React.FC<{
+  stream: MediaStream | null | undefined;
+  muted?: boolean;
+  mirror?: boolean;
+  className?: string;
+}> = ({ stream, muted = true, mirror = false, className = '' }) => {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+
+  useEffect(() => {
+    const el = videoRef.current;
+    if (!el) return;
+    if (stream && stream.getVideoTracks().length > 0) {
+      if (el.srcObject !== stream) {
+        el.srcObject = stream;
+      }
+      el.play().catch(() => {
+        // Autoplay fallback handled by browser interaction
+      });
+    } else {
+      el.srcObject = null;
+    }
+  }, [stream]);
+
+  if (!stream || stream.getVideoTracks().length === 0) return null;
+
+  return (
+    <video
+      ref={videoRef}
+      playsInline
+      autoPlay
+      muted={muted}
+      className={`${className} ${mirror ? '-scale-x-100' : ''}`}
+    />
+  );
+};
+
+/**
+ * Binds incoming remote WebRTC audio streams so participants hear live voice in real time.
+ */
+const RemoteAudioPlayer: React.FC<{ stream: MediaStream }> = ({ stream }) => {
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => {
+    const el = audioRef.current;
+    if (!el) return;
+    if (el.srcObject !== stream) {
+      el.srcObject = stream;
+    }
+    el.play().catch(() => {});
+  }, [stream]);
+
+  return <audio ref={audioRef} autoPlay playsInline className="hidden" />;
+};
+
 export default function App() {
   const urlParams =
     typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : null;
@@ -99,13 +157,19 @@ export default function App() {
   );
   const [remoteLaser, setRemoteLaser] = useState<LaserPointerPosition | null>(null);
   const [floatingReactions, setFloatingReactions] = useState<EmojiReactionEvent[]>([]);
+  const [remoteStreams, setRemoteStreams] = useState<Record<string, MediaStream>>({});
+
+  // Real Hardware Camera, Microphone, Screen Share & Voice Volume State
+  const [localCamStream, setLocalCamStream] = useState<MediaStream | null>(null);
+  const [localMicStream, setLocalMicStream] = useState<MediaStream | null>(null);
+  const [localScreenStream, setLocalScreenStream] = useState<MediaStream | null>(null);
+  const [localAudioLevel, setLocalAudioLevel] = useState<number>(0);
 
   // Workspace Layout & Responsive State
   const [activeTab, setActiveTab] = useState<ActiveSidebarTab>('attendance');
   const [mobileSheetTab, setMobileSheetTab] = useState<ActiveSidebarTab | null>(null);
   const [zenMode, setZenMode] = useState<boolean>(false);
   const [isRecording, setIsRecording] = useState<boolean>(false);
-  const [isScreenSharing, setIsScreenSharing] = useState<boolean>(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
   // Synced Class Timer State (Starts paused until started by user)
@@ -116,20 +180,23 @@ export default function App() {
   const [pipMinimized, setPipMinimized] = useState<boolean>(false);
   const [pipCorner, setPipCorner] = useState<'top-right' | 'bottom-right' | 'top-left'>('top-right');
 
-  // Refs for Media & Canvas Recording
-  const localVideoRef = useRef<HTMLVideoElement | null>(null);
-  const localStreamRef = useRef<MediaStream | null>(null);
+  // Hardware Media Refs
+  const localCameraStreamRef = useRef<MediaStream | null>(null);
+  const localMicStreamRef = useRef<MediaStream | null>(null);
+  const localScreenStreamRef = useRef<MediaStream | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserIntervalRef = useRef<number | null>(null);
   const whiteboardCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const participantIdRef = useRef<string>(
     `u-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
   );
 
-  const showToast = (msg: string) => {
+  const showToast = useCallback((msg: string) => {
     setToastMessage(msg);
     window.setTimeout(() => {
       setToastMessage((prev) => (prev === msg ? null : prev));
     }, 3800);
-  };
+  }, []);
 
   const refreshRooms = useCallback(async () => {
     setIsLoadingRooms(true);
@@ -147,7 +214,7 @@ export default function App() {
     document.documentElement.setAttribute('data-theme', theme);
   }, [theme]);
 
-  // Subscribe to B2RoomEngine updates
+  // Subscribe to B2RoomEngine updates & WebRTC Remote Streams
   useEffect(() => {
     const unsubRoom = roomEngine.subscribe((next) => setRoomState({ ...next }));
     const unsubConn = roomEngine.subscribeConnection((c) => setConnState(c));
@@ -158,13 +225,37 @@ export default function App() {
         setFloatingReactions((prev) => prev.filter((r) => r.id !== reaction.id));
       }, 2800);
     });
+    const unsubStreams = roomEngine.subscribeRemoteStreams((streams) => {
+      setRemoteStreams({ ...streams });
+    });
 
     return () => {
       unsubRoom();
       unsubConn();
       unsubLaser();
       unsubReact();
+      unsubStreams();
     };
+  }, []);
+
+  // Sync combined local MediaStream (Camera/Screen + Mic) to WebRTC Engine
+  const syncCombinedStreamToWebRTC = useCallback(() => {
+    const tracks: MediaStreamTrack[] = [];
+    if (localScreenStreamRef.current) {
+      tracks.push(...localScreenStreamRef.current.getVideoTracks());
+    } else if (localCameraStreamRef.current) {
+      tracks.push(...localCameraStreamRef.current.getVideoTracks());
+    }
+    if (localMicStreamRef.current) {
+      tracks.push(...localMicStreamRef.current.getAudioTracks());
+    }
+
+    if (tracks.length === 0) {
+      roomEngine.setLocalMediaStream(null);
+    } else {
+      const combined = new MediaStream(tracks);
+      roomEngine.setLocalMediaStream(combined);
+    }
   }, []);
 
   // Connect to room when inClassroom becomes true
@@ -186,6 +277,17 @@ export default function App() {
       role: userRole,
     });
 
+    // Sync any already-enabled Lobby Camera/Mic state into the joined classroom
+    const isCamActive = Boolean(localCameraStreamRef.current || localScreenStreamRef.current);
+    const isMicActive = Boolean(localMicStreamRef.current);
+    if (isCamActive || isMicActive) {
+      roomEngine.setLocalMediaState(participantIdRef.current, {
+        camOff: !isCamActive,
+        micMuted: !isMicActive,
+      });
+      syncCombinedStreamToWebRTC();
+    }
+
     return () => {
       roomEngine.disconnect();
     };
@@ -197,6 +299,7 @@ export default function App() {
     userName,
     userRole,
     roomsDirectory,
+    syncCombinedStreamToWebRTC,
   ]);
 
   // Anti-Cheat Focus Radar: Detect Tab Switch (`visibilitychange`) and Window Blur
@@ -262,15 +365,236 @@ export default function App() {
     return () => window.clearInterval(interval);
   }, [inClassroom, timerRunning]);
 
-  // Clean up local camera/screen tracks on unmount
+  // Clean up all hardware camera/mic/screen tracks on unmount
   useEffect(() => {
     return () => {
-      if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach((t) => t.stop());
+      if (localCameraStreamRef.current) {
+        localCameraStreamRef.current.getTracks().forEach((t) => t.stop());
+      }
+      if (localMicStreamRef.current) {
+        localMicStreamRef.current.getTracks().forEach((t) => t.stop());
+      }
+      if (localScreenStreamRef.current) {
+        localScreenStreamRef.current.getTracks().forEach((t) => t.stop());
+      }
+      if (analyserIntervalRef.current) {
+        window.clearInterval(analyserIntervalRef.current);
+      }
+      if (audioContextRef.current) {
+        audioContextRef.current.close().catch(() => {});
       }
       rainAudioEngine.stopRain();
     };
   }, []);
+
+  // ============================================================================
+  // FIX 1: REAL HARDWARE CAMERA & MICROPHONE CAPTURE + VOICE ANALYSER
+  // ============================================================================
+
+  const handleToggleCamera = async () => {
+    const pid = participantIdRef.current;
+    const currentParticipant = roomState.participants[pid];
+
+    if (inClassroom && userRole === 'student' && !currentParticipant?.camGranted) {
+      showToast('Raise your hand so the Instructor can grant you Microphone/Camera access.');
+      return;
+    }
+
+    // Turn Camera OFF
+    if (localCameraStreamRef.current) {
+      localCameraStreamRef.current.getTracks().forEach((track) => track.stop());
+      localCameraStreamRef.current = null;
+      setLocalCamStream(null);
+      roomEngine.setLocalMediaState(pid, {
+        camOff: !localScreenStreamRef.current,
+      });
+      syncCombinedStreamToWebRTC();
+      showToast('Camera turned off.');
+      return;
+    }
+
+    // Turn Camera ON via navigator.mediaDevices.getUserMedia
+    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+      showToast('Camera access is not supported in this browser environment.');
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          facingMode: 'user',
+        },
+        audio: false,
+      });
+
+      localCameraStreamRef.current = stream;
+      setLocalCamStream(stream);
+
+      stream.getVideoTracks()[0]?.addEventListener('ended', () => {
+        localCameraStreamRef.current = null;
+        setLocalCamStream(null);
+        roomEngine.setLocalMediaState(pid, { camOff: true });
+        syncCombinedStreamToWebRTC();
+      });
+
+      roomEngine.setLocalMediaState(pid, { camOff: false });
+      syncCombinedStreamToWebRTC();
+      showToast('Live camera active.');
+    } catch {
+      showToast('Could not access camera. Please check your browser camera permissions.');
+    }
+  };
+
+  const handleToggleMicrophone = async () => {
+    const pid = participantIdRef.current;
+    const currentParticipant = roomState.participants[pid];
+
+    if (inClassroom && userRole === 'student' && !currentParticipant?.micGranted) {
+      showToast('Raise your hand so the Instructor can grant you Microphone/Camera access.');
+      return;
+    }
+
+    // Mute Microphone & Stop Hardware Audio Track
+    if (localMicStreamRef.current) {
+      localMicStreamRef.current.getTracks().forEach((track) => {
+        track.enabled = false;
+        track.stop();
+      });
+      localMicStreamRef.current = null;
+      setLocalMicStream(null);
+      setLocalAudioLevel(0);
+
+      if (analyserIntervalRef.current) {
+        window.clearInterval(analyserIntervalRef.current);
+        analyserIntervalRef.current = null;
+      }
+      if (audioContextRef.current) {
+        audioContextRef.current.close().catch(() => {});
+        audioContextRef.current = null;
+      }
+
+      roomEngine.setLocalMediaState(pid, {
+        micMuted: true,
+        isSpeaking: false,
+        audioLevel: 0,
+      });
+      syncCombinedStreamToWebRTC();
+      showToast('Microphone muted.');
+      return;
+    }
+
+    // Unmute Microphone via navigator.mediaDevices.getUserMedia + Web Audio AnalyserNode
+    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+      showToast('Microphone access is not supported in this browser environment.');
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+        video: false,
+      });
+
+      localMicStreamRef.current = stream;
+      setLocalMicStream(stream);
+      roomEngine.setLocalMediaState(pid, { micMuted: false });
+      syncCombinedStreamToWebRTC();
+
+      // Attach Web Audio API AnalyserNode for real-time voice level & speaking glow
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      if (AudioCtx) {
+        const audioCtx = new AudioCtx();
+        audioContextRef.current = audioCtx;
+        if (audioCtx.state === 'suspended') {
+          await audioCtx.resume();
+        }
+        const source = audioCtx.createMediaStreamSource(stream);
+        const analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 256;
+        analyser.smoothingTimeConstant = 0.65;
+        source.connect(analyser);
+
+        const freqData = new Uint8Array(analyser.frequencyBinCount);
+        if (analyserIntervalRef.current) {
+          window.clearInterval(analyserIntervalRef.current);
+        }
+        analyserIntervalRef.current = window.setInterval(() => {
+          if (!localMicStreamRef.current) return;
+          analyser.getByteFrequencyData(freqData);
+          let sum = 0;
+          for (let i = 0; i < freqData.length; i++) {
+            sum += freqData[i];
+          }
+          const avg = sum / freqData.length;
+          const level = Math.min(100, Math.round((avg / 110) * 100));
+          const speaking = level > 12;
+          setLocalAudioLevel(level);
+          roomEngine.setLocalMediaState(pid, {
+            micMuted: false,
+            isSpeaking: speaking,
+            audioLevel: level,
+          });
+        }, 160);
+      }
+
+      showToast('Microphone unmuted and broadcasting.');
+    } catch {
+      showToast('Could not access microphone. Please check your browser microphone permissions.');
+    }
+  };
+
+  // Screen Share with Mobile Compatibility Guard + WebRTC Broadcast
+  const handleToggleScreenShare = async () => {
+    const pid = participantIdRef.current;
+
+    if (localScreenStreamRef.current) {
+      localScreenStreamRef.current.getTracks().forEach((t) => t.stop());
+      localScreenStreamRef.current = null;
+      setLocalScreenStream(null);
+      roomEngine.setLocalMediaState(pid, {
+        camOff: !localCameraStreamRef.current,
+      });
+      syncCombinedStreamToWebRTC();
+      showToast('Screen share ended.');
+      return;
+    }
+
+    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getDisplayMedia !== 'function') {
+      showToast(
+        'Screen sharing is not supported on mobile browsers. Use PDF/Image Upload or the 16:9 Vector Whiteboard instead.'
+      );
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+      localScreenStreamRef.current = stream;
+      setLocalScreenStream(stream);
+      roomEngine.setLocalMediaState(pid, { camOff: false });
+      syncCombinedStreamToWebRTC();
+
+      stream.getVideoTracks()[0]?.addEventListener('ended', () => {
+        localScreenStreamRef.current = null;
+        setLocalScreenStream(null);
+        roomEngine.setLocalMediaState(pid, {
+          camOff: !localCameraStreamRef.current,
+        });
+        syncCombinedStreamToWebRTC();
+      });
+
+      showToast('Broadcasting live screen share to classroom.');
+    } catch {
+      showToast('Screen share cancelled or blocked by browser permissions.');
+    }
+  };
 
   const handleJoinClassroom = async (
     roomOverride?: ClassroomSummary,
@@ -297,7 +621,6 @@ export default function App() {
       return;
     }
 
-    // Check if an existing room is selected
     const existing = roomsDirectory.find((r) => r.id === selectedRoomId);
     if (existing) {
       setRoomTitleInput(existing.name);
@@ -311,7 +634,6 @@ export default function App() {
       return;
     }
 
-    // Otherwise create a new room on the server from roomTitleInput
     const trimmedRoomTitle = roomTitleInput.trim();
     if (!trimmedRoomTitle) {
       setFormError('Please enter a classroom name or select an existing classroom.');
@@ -338,44 +660,6 @@ export default function App() {
 
     if (rainVolume > 0 && rainIntensity !== 'off') {
       rainAudioEngine.setRainConfig(rainIntensity, rainVolume);
-    }
-  };
-
-  // Screen Share with Mobile Compatibility Guard
-  const handleToggleScreenShare = async () => {
-    if (isScreenSharing) {
-      if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach((t) => t.stop());
-        localStreamRef.current = null;
-      }
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = null;
-      }
-      setIsScreenSharing(false);
-      showToast('Screen share ended.');
-      return;
-    }
-
-    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getDisplayMedia !== 'function') {
-      showToast(
-        'Screen sharing is not supported on mobile browsers. Use Slide Image Upload or the 16:9 Vector Whiteboard instead.'
-      );
-      return;
-    }
-
-    try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
-      localStreamRef.current = stream;
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = stream;
-      }
-      setIsScreenSharing(true);
-      stream.getVideoTracks()[0].onended = () => {
-        setIsScreenSharing(false);
-      };
-      showToast('Broadcasting live screen share to classroom.');
-    } catch {
-      showToast('Screen share cancelled or blocked by browser permissions.');
     }
   };
 
@@ -435,7 +719,7 @@ export default function App() {
   };
 
   const participantsArray = Object.values(roomState.participants);
-  const localParticipantId = roomEngine.getLocalParticipantId();
+  const localParticipantId = participantIdRef.current;
   const localParticipant = roomState.participants[localParticipantId];
   const hostParticipant =
     participantsArray.find((p) => p.role === 'teacher') || localParticipant;
@@ -444,6 +728,23 @@ export default function App() {
     userRole === 'teacher' ||
     userRole === 'assistant' ||
     Boolean(localParticipant?.penGranted);
+
+  const isLocalCamOn = Boolean(localCamStream);
+  const isLocalMicOn = Boolean(localMicStream);
+  const isScreenSharing = Boolean(localScreenStream);
+
+  // Determine the active primary video stream to display in the Host/Stage tile
+  const activeStageStream: MediaStream | null =
+    localScreenStream ||
+    localCamStream ||
+    (hostParticipant && remoteStreams[hostParticipant.id]) ||
+    Object.values(remoteStreams)[0] ||
+    null;
+
+  const isStageStreamLocal = Boolean(localScreenStream || localCamStream);
+  const isHostSpeaking =
+    Boolean(localMicStream && localAudioLevel > 12) ||
+    Boolean(hostParticipant?.isSpeaking);
 
   const formatTimer = (sec: number) => {
     const m = Math.floor(sec / 60)
@@ -462,6 +763,17 @@ export default function App() {
     return (
       <div className="relative h-[100dvh] max-h-[100dvh] w-screen overflow-y-auto overflow-x-hidden flex flex-col justify-between p-4 sm:p-6 lg:p-8 select-none">
         <RainBackdropCanvas intensity={rainIntensity} theme={theme} />
+
+        {/* System Toast Notification in Lobby */}
+        {toastMessage && (
+          <div
+            role="status"
+            className="fixed top-6 left-1/2 -translate-x-1/2 z-[60] b2-glass-elevated px-4 py-2.5 rounded-xl shadow-2xl border border-[#D4A373]/50 text-xs font-medium text-[var(--text-primary)] flex items-center gap-2"
+          >
+            <Sparkles className="w-4 h-4 text-[#D4A373] shrink-0" />
+            <span>{toastMessage}</span>
+          </div>
+        )}
 
         {/* Top Bar Contract: Zone 1 Brand | Zone 2 Nav Links | Zone 3 Primary Action */}
         <header className="relative z-20 flex items-center justify-between gap-8 max-w-7xl w-full mx-auto b2-glass-pod rounded-2xl px-5 py-3.5 shrink-0">
@@ -498,7 +810,12 @@ export default function App() {
               }
               className="hover:text-[var(--text-primary)] transition-colors whitespace-nowrap shrink-0"
             >
-              Theme: {theme === 'espresso' ? 'Rainy Espresso' : theme === 'noir' ? 'Obsidian Noir' : 'Ivory Daylight'}
+              Theme:{' '}
+              {theme === 'espresso'
+                ? 'Rainy Espresso'
+                : theme === 'noir'
+                ? 'Obsidian Noir'
+                : 'Ivory Daylight'}
             </button>
             <button
               type="button"
@@ -894,12 +1211,12 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Right Column: Studio Preview & Atmospheric Acoustic Calibrator */}
+              {/* Right Column: Live Hardware Camera/Mic Studio Preview & Rain Calibrator */}
               <div className="lg:col-span-5 b2-glass-pod rounded-3xl p-6 flex flex-col justify-between gap-5">
                 <div className="space-y-3">
                   <div className="flex items-center justify-between text-xs text-[var(--text-secondary)]">
                     <span className="font-semibold text-[var(--text-primary)]">
-                      Studio Preview
+                      Studio Camera &amp; Mic Preview
                     </span>
                     <span className="font-mono-tabular text-[#D4A373]">
                       {currentSelectedRoom
@@ -908,13 +1225,83 @@ export default function App() {
                     </span>
                   </div>
 
-                  <div className="relative aspect-video w-full rounded-2xl overflow-hidden bg-[#0D0A08] border border-[var(--border-specular)] flex flex-col items-center justify-center p-4">
-                    <BrandLogo size="lg" showText={true} />
-                    <p className="text-xs text-[var(--text-muted)] mt-3 text-center max-w-xs">
-                      {userName.trim()
-                        ? `Ready to join as ${userName.trim()} (${userRole})`
-                        : 'Enter your display name and classroom title to begin.'}
-                    </p>
+                  <div
+                    className={`relative aspect-video w-full rounded-2xl overflow-hidden bg-[#0D0A08] border transition-all flex flex-col items-center justify-center ${
+                      isLocalMicOn && localAudioLevel > 12
+                        ? 'border-[#D4A373] shadow-[0_0_24px_rgba(212,163,115,0.3)]'
+                        : 'border-[var(--border-specular)]'
+                    }`}
+                  >
+                    <LiveStreamVideo
+                      stream={localCamStream}
+                      muted={true}
+                      mirror={true}
+                      className="w-full h-full object-cover"
+                    />
+
+                    {!isLocalCamOn && (
+                      <div className="flex flex-col items-center justify-center p-4">
+                        <BrandLogo size="lg" showText={true} />
+                        <p className="text-xs text-[var(--text-muted)] mt-3 text-center max-w-xs">
+                          {userName.trim()
+                            ? `Ready to join as ${userName.trim()} (${userRole})`
+                            : 'Enter your display name and classroom title to begin.'}
+                        </p>
+                      </div>
+                    )}
+
+                    {/* Lobby Camera & Mic Test Controls Overlay */}
+                    <div className="absolute bottom-3 left-3 right-3 flex items-center justify-between gap-2 bg-black/65 backdrop-blur-md px-3 py-2 rounded-xl border border-white/10">
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={handleToggleMicrophone}
+                          className={`px-2.5 py-1.5 rounded-lg text-xs font-medium inline-flex items-center gap-1.5 transition-colors ${
+                            isLocalMicOn
+                              ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                              : 'bg-white/10 text-[var(--text-secondary)] hover:bg-white/15'
+                          }`}
+                        >
+                          {isLocalMicOn ? (
+                            <Mic className="w-3.5 h-3.5" />
+                          ) : (
+                            <MicOff className="w-3.5 h-3.5" />
+                          )}
+                          <span>{isLocalMicOn ? 'Mic On' : 'Test Mic'}</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={handleToggleCamera}
+                          className={`px-2.5 py-1.5 rounded-lg text-xs font-medium inline-flex items-center gap-1.5 transition-colors ${
+                            isLocalCamOn
+                              ? 'bg-[#D4A373]/25 text-[#D4A373] border border-[#D4A373]/50'
+                              : 'bg-white/10 text-[var(--text-secondary)] hover:bg-white/15'
+                          }`}
+                        >
+                          {isLocalCamOn ? (
+                            <Video className="w-3.5 h-3.5" />
+                          ) : (
+                            <VideoOff className="w-3.5 h-3.5" />
+                          )}
+                          <span>{isLocalCamOn ? 'Cam On' : 'Test Cam'}</span>
+                        </button>
+                      </div>
+
+                      {isLocalMicOn && (
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-[10px] font-mono-tabular text-[#D4A373]">
+                            Voice
+                          </span>
+                          <div className="w-16 h-2 rounded-full bg-white/10 overflow-hidden">
+                            <div
+                              className="h-full bg-[#D4A373] transition-all duration-100"
+                              style={{ width: `${localAudioLevel}%` }}
+                            />
+                          </div>
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </div>
 
@@ -981,7 +1368,7 @@ export default function App() {
         {/* Quiet Editorial Footer */}
         <footer className="relative z-10 max-w-7xl w-full mx-auto flex flex-wrap items-center justify-between gap-4 text-xs text-[var(--text-muted)] py-2 shrink-0">
           <span>B2.Connect Virtual Classroom Platform</span>
-          <span className="font-mono-tabular">16:9 Vector Canvas · UTF-8 BiDi Ready</span>
+          <span className="font-mono-tabular">16:9 Vector Canvas · WebRTC Live Media</span>
         </footer>
       </div>
     );
@@ -994,6 +1381,13 @@ export default function App() {
     <div className="relative h-[100dvh] max-h-[100dvh] w-screen overflow-hidden flex flex-col select-none">
       {/* z-0: 60fps HTML5 Rain & Café Bokeh Canvas */}
       <RainBackdropCanvas intensity={rainIntensity} theme={theme} />
+
+      {/* Hidden WebRTC Remote Audio Players so students hear Host/Speaker voice */}
+      {Object.entries(remoteStreams).map(([peerId, stream]) =>
+        peerId !== localParticipantId ? (
+          <RemoteAudioPlayer key={peerId} stream={stream} />
+        ) : null
+      )}
 
       {/* Floating Live Screen Emoji Reactions Overlay */}
       <div className="fixed inset-0 pointer-events-none z-50 overflow-hidden">
@@ -1199,42 +1593,34 @@ export default function App() {
           </div>
         </div>
 
-        {/* Right Zone: Media Controls, Recorder, Atmosphere Popover, Zen Mode & Leave */}
+        {/* Right Zone: Hardware Media Controls, Recorder, Atmosphere Popover, Zen Mode & Leave */}
         <div className="flex items-center gap-1.5 shrink-0">
           <button
             type="button"
-            aria-label={localParticipant?.micMuted ? 'Unmute Microphone' : 'Mute Microphone'}
-            onClick={() => roomEngine.toggleLocalMedia(localParticipantId, 'mic')}
+            aria-label={isLocalMicOn ? 'Mute Microphone' : 'Unmute Microphone'}
+            onClick={handleToggleMicrophone}
             className={`p-2 rounded-xl border transition-colors ${
-              !localParticipant?.micMuted
+              isLocalMicOn
                 ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
-                : 'bg-white/5 text-[var(--text-secondary)] border-[var(--border-specular)]'
+                : 'bg-white/5 text-[var(--text-secondary)] border-[var(--border-specular)] hover:bg-white/10'
             }`}
-            title="Toggle Microphone"
+            title={isLocalMicOn ? 'Mute Microphone' : 'Unmute Microphone'}
           >
-            {!localParticipant?.micMuted ? (
-              <Mic className="w-4 h-4" />
-            ) : (
-              <MicOff className="w-4 h-4" />
-            )}
+            {isLocalMicOn ? <Mic className="w-4 h-4" /> : <MicOff className="w-4 h-4" />}
           </button>
 
           <button
             type="button"
-            aria-label={localParticipant?.camOff ? 'Turn Camera On' : 'Turn Camera Off'}
-            onClick={() => roomEngine.toggleLocalMedia(localParticipantId, 'cam')}
+            aria-label={isLocalCamOn ? 'Turn Camera Off' : 'Turn Camera On'}
+            onClick={handleToggleCamera}
             className={`p-2 rounded-xl border transition-colors ${
-              !localParticipant?.camOff
-                ? 'bg-[#D4A373]/20 text-[#D4A373] border-[#D4A373]/40'
-                : 'bg-white/5 text-[var(--text-secondary)] border-[var(--border-specular)]'
+              isLocalCamOn
+                ? 'bg-[#D4A373]/25 text-[#D4A373] border-[#D4A373]/50'
+                : 'bg-white/5 text-[var(--text-secondary)] border-[var(--border-specular)] hover:bg-white/10'
             }`}
-            title="Toggle Camera"
+            title={isLocalCamOn ? 'Turn Camera Off' : 'Turn Camera On'}
           >
-            {!localParticipant?.camOff ? (
-              <Video className="w-4 h-4" />
-            ) : (
-              <VideoOff className="w-4 h-4" />
-            )}
+            {isLocalCamOn ? <Video className="w-4 h-4" /> : <VideoOff className="w-4 h-4" />}
           </button>
 
           <button
@@ -1415,29 +1801,65 @@ export default function App() {
 
       {/* z-10: Main Responsive Multi-Pod Workspace */}
       <main className="relative z-10 flex-1 min-h-0 w-full flex flex-col lg:flex-row gap-2.5 p-2 sm:p-3 overflow-hidden">
-        {/* Center Primary Stage (Whiteboard / Exam Mode / Seminar Grid) */}
+        {/* Center Primary Stage (Whiteboard / Lecture Stage / Exam Mode / Seminar Grid) */}
         <section className="flex-1 min-h-0 min-w-0 flex flex-col overflow-hidden">
           {roomState.activeLayout === 'seminar' ? (
-            /* Seminar Multi-Participant Discussion Grid (Only Real Connected Participants) */
+            /* Seminar Multi-Participant Discussion Grid with Real Camera & WebRTC Streams */
             <div className="flex-1 min-h-0 b2-glass-pod rounded-2xl p-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 overflow-y-auto">
-              {participantsArray.map((p) => (
-                <div
-                  key={p.id}
-                  className={`relative rounded-2xl bg-[#0D0A08] border p-4 flex flex-col items-center justify-center min-h-[160px] ${
-                    !p.micMuted
-                      ? 'border-[#D4A373] ring-2 ring-[#D4A373]/40'
-                      : 'border-[var(--border-specular)]'
-                  }`}
-                >
-                  <BrandLogo size="sm" showText={false} />
-                  <div dir="auto" className="text-xs font-bold text-[var(--text-primary)] mt-2.5">
-                    {p.name}
+              {participantsArray.map((p) => {
+                const isMe = p.id === localParticipantId;
+                const peerStream = isMe
+                  ? localScreenStream || localCamStream
+                  : remoteStreams[p.id];
+                const hasLiveVideo = Boolean(peerStream && peerStream.getVideoTracks().length > 0);
+                const isSpeakingNow = isMe
+                  ? isLocalMicOn && localAudioLevel > 12
+                  : Boolean(p.isSpeaking);
+
+                return (
+                  <div
+                    key={p.id}
+                    className={`relative rounded-2xl bg-[#0D0A08] border overflow-hidden flex flex-col items-center justify-center min-h-[180px] transition-all ${
+                      isSpeakingNow
+                        ? 'border-[#D4A373] ring-2 ring-[#D4A373]/50 shadow-[0_0_24px_rgba(212,163,115,0.28)]'
+                        : !p.micMuted
+                        ? 'border-[#D4A373]/60'
+                        : 'border-[var(--border-specular)]'
+                    }`}
+                  >
+                    {hasLiveVideo ? (
+                      <LiveStreamVideo
+                        stream={peerStream}
+                        muted={isMe}
+                        mirror={isMe && !localScreenStream}
+                        className="w-full h-full object-cover absolute inset-0"
+                      />
+                    ) : (
+                      <div className="flex flex-col items-center justify-center p-4">
+                        <BrandLogo size="sm" showText={false} />
+                        <div
+                          dir="auto"
+                          className="text-xs font-bold text-[var(--text-primary)] mt-2.5"
+                        >
+                          {p.name}
+                        </div>
+                        <div className="text-[11px] font-mono-tabular text-[var(--text-muted)] mt-0.5">
+                          {p.role.toUpperCase()} · {p.engagementXp} XP
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="absolute bottom-2 left-2 right-2 flex items-center justify-between text-[11px] bg-black/65 backdrop-blur-md px-2.5 py-1 rounded-lg">
+                      <span dir="auto" className="font-semibold text-[var(--text-primary)] truncate">
+                        {p.name}
+                      </span>
+                      <span className="font-mono-tabular text-[#D4A373]">
+                        {!p.micMuted ? '● Live Mic' : 'Muted'}
+                      </span>
+                    </div>
                   </div>
-                  <div className="text-[11px] font-mono-tabular text-[var(--text-muted)] mt-0.5">
-                    {p.role.toUpperCase()} · {p.engagementXp} XP
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           ) : roomState.activeLayout === 'exam' ? (
             /* Live Exam / Quiz Lock Mode: Split Stage with Timed Quiz & Anti-Cheat Focus Radar */
@@ -1508,23 +1930,25 @@ export default function App() {
         {/* z-20: Desktop & Tablet Docked Right Interaction Pod (Hidden in Zen Mode or Mobile) */}
         {!zenMode && (
           <aside className="hidden md:flex md:w-80 lg:w-96 shrink-0 flex-col gap-2.5 min-h-0 h-full">
-            {/* Live Broadcast Video Tile with Real Host Name */}
+            {/* Live Hardware Camera / Screen Share / WebRTC Video Tile with Voice Glow */}
             <div
               className={`relative rounded-2xl overflow-hidden bg-[#0D0A08] border p-3 shrink-0 transition-all ${
-                !localParticipant?.micMuted
-                  ? 'border-[#D4A373] shadow-[0_0_20px_rgba(212,163,115,0.2)]'
+                isHostSpeaking
+                  ? 'border-[#D4A373] ring-2 ring-[#D4A373]/40 shadow-[0_0_24px_rgba(212,163,115,0.3)]'
+                  : !localParticipant?.micMuted
+                  ? 'border-[#D4A373]/60'
                   : 'border-[var(--border-specular)]'
               }`}
             >
               <div className="relative aspect-video w-full rounded-xl overflow-hidden bg-[#14100E] flex flex-col items-center justify-center">
-                <video
-                  ref={localVideoRef}
-                  playsInline
-                  autoPlay
-                  muted
-                  className={`w-full h-full object-cover ${isScreenSharing ? 'block' : 'hidden'}`}
+                <LiveStreamVideo
+                  stream={activeStageStream}
+                  muted={isStageStreamLocal}
+                  mirror={Boolean(localCamStream && !localScreenStream)}
+                  className="w-full h-full object-cover"
                 />
-                {!isScreenSharing && (
+
+                {!activeStageStream && (
                   <div className="flex flex-col items-center justify-center text-center p-2">
                     <BrandLogo size="sm" showText={true} />
                     <span dir="auto" className="text-[11px] text-[var(--text-muted)] mt-1.5">
@@ -1533,13 +1957,23 @@ export default function App() {
                   </div>
                 )}
 
-                <div className="absolute bottom-2 left-2 right-2 flex items-center justify-between text-[11px] bg-black/60 backdrop-blur-md px-2.5 py-1 rounded-lg">
+                <div className="absolute bottom-2 left-2 right-2 flex items-center justify-between text-[11px] bg-black/65 backdrop-blur-md px-2.5 py-1 rounded-lg">
                   <span dir="auto" className="font-medium text-[var(--text-primary)] truncate">
                     {hostParticipant?.name || userName}
                   </span>
-                  <span className="font-mono-tabular text-[#D4A373]">
-                    {!localParticipant?.micMuted ? '● Mic On' : 'Muted'}
-                  </span>
+                  <div className="flex items-center gap-2">
+                    {isLocalMicOn && (
+                      <div className="w-10 h-1.5 rounded-full bg-white/15 overflow-hidden">
+                        <div
+                          className="h-full bg-[#D4A373] transition-all duration-100"
+                          style={{ width: `${localAudioLevel}%` }}
+                        />
+                      </div>
+                    )}
+                    <span className="font-mono-tabular text-[#D4A373]">
+                      {!localParticipant?.micMuted ? '● Mic On' : 'Muted'}
+                    </span>
+                  </div>
                 </div>
               </div>
             </div>
@@ -1617,20 +2051,29 @@ export default function App() {
                 )}
                 {activeTab === 'chat' && (
                   <ChatPod
+                    roomId={roomState.roomId}
                     messages={roomState.messages}
+                    participants={participantsArray}
                     chatLocked={roomState.chatLocked}
                     localParticipantId={localParticipantId}
                     localParticipantName={userName || 'Host'}
                     localRole={userRole}
-                    onSendMessage={(ch, txt) =>
+                    onSendMessage={(ch, txt, targetId, targetName) =>
                       roomEngine.sendChatMessage({
                         senderId: localParticipantId,
                         senderName: userName || 'Host',
                         senderRole: userRole,
                         channel: ch,
                         text: txt,
+                        targetParticipantId: targetId,
+                        targetParticipantName: targetName,
                       })
                     }
+                    onClearChat={() => {
+                      roomEngine.clearChat();
+                      showToast('Cleared all chat messages in this classroom.');
+                    }}
+                    onDeleteMessage={(msgId) => roomEngine.deleteChatMessage(msgId)}
                     onToggleChatLock={() => roomEngine.toggleChatLock()}
                     onSendReaction={(em) =>
                       roomEngine.sendEmojiReaction(localParticipantId, userName || 'Host', em)
@@ -1689,7 +2132,7 @@ export default function App() {
         )}
       </main>
 
-      {/* z-30: Mobile Floating Corner-Snap PiP Teacher Video Card (< 768px) */}
+      {/* z-30: Mobile Floating Corner-Snap PiP Video Card (< 768px) */}
       <div
         className={`md:hidden fixed z-30 transition-all ${
           pipCorner === 'top-right'
@@ -1711,7 +2154,7 @@ export default function App() {
             </span>
           </button>
         ) : (
-          <div className="w-32 b2-glass-elevated rounded-2xl p-2 border border-[#D4A373]/40 shadow-xl">
+          <div className="w-36 b2-glass-elevated rounded-2xl p-2 border border-[#D4A373]/40 shadow-xl">
             <div className="flex items-center justify-between text-[10px] text-[var(--text-muted)] mb-1">
               <button
                 type="button"
@@ -1737,14 +2180,24 @@ export default function App() {
                 –
               </button>
             </div>
-            <div className="aspect-video rounded-lg bg-[#0D0A08] flex flex-col items-center justify-center p-1">
-              <BrandLogo size="xs" showText={false} />
-              <span
-                dir="auto"
-                className="text-[10px] text-[var(--text-primary)] font-medium mt-1 truncate max-w-full"
-              >
-                {hostParticipant?.name || userName}
-              </span>
+            <div className="relative aspect-video rounded-lg overflow-hidden bg-[#0D0A08] flex flex-col items-center justify-center p-1">
+              <LiveStreamVideo
+                stream={activeStageStream}
+                muted={isStageStreamLocal}
+                mirror={Boolean(localCamStream && !localScreenStream)}
+                className="w-full h-full object-cover absolute inset-0"
+              />
+              {!activeStageStream && (
+                <>
+                  <BrandLogo size="xs" showText={false} />
+                  <span
+                    dir="auto"
+                    className="text-[10px] text-[var(--text-primary)] font-medium mt-1 truncate max-w-full"
+                  >
+                    {hostParticipant?.name || userName}
+                  </span>
+                </>
+              )}
             </div>
           </div>
         )}
@@ -1818,20 +2271,29 @@ export default function App() {
               )}
               {mobileSheetTab === 'chat' && (
                 <ChatPod
+                  roomId={roomState.roomId}
                   messages={roomState.messages}
+                  participants={participantsArray}
                   chatLocked={roomState.chatLocked}
                   localParticipantId={localParticipantId}
                   localParticipantName={userName || 'Host'}
                   localRole={userRole}
-                  onSendMessage={(ch, txt) =>
+                  onSendMessage={(ch, txt, targetId, targetName) =>
                     roomEngine.sendChatMessage({
                       senderId: localParticipantId,
                       senderName: userName || 'Host',
                       senderRole: userRole,
                       channel: ch,
                       text: txt,
+                      targetParticipantId: targetId,
+                      targetParticipantName: targetName,
                     })
                   }
+                  onClearChat={() => {
+                    roomEngine.clearChat();
+                    showToast('Cleared all chat messages in this classroom.');
+                  }}
+                  onDeleteMessage={(msgId) => roomEngine.deleteChatMessage(msgId)}
                   onToggleChatLock={() => roomEngine.toggleChatLock()}
                   onSendReaction={(em) =>
                     roomEngine.sendEmojiReaction(localParticipantId, userName || 'Host', em)
